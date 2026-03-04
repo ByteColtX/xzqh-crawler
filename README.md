@@ -1,162 +1,126 @@
-# 行政区划代码爬虫
+# xzqh-crawler（行政区划数据爬虫）
 
-一个简单的Python爬虫，用于从民政部网站获取行政区划代码数据。
+从民政部「全国行政区划信息查询平台」接口抓取 1–4 级行政区划数据，并落库到 SQLite。
 
-## 功能特性
+- 数据层级：
+  - L1 省/直辖市/自治区
+  - L2 地级市/地区/自治州
+  - L3 区县
+  - L4 乡镇/街道
+- 数据源接口：`https://dmfw.mca.gov.cn/xzqh/getList?code=...&trimCode=true&maxLevel=...`
+- 输出：SQLite（默认写入 `data/`）
 
-- ✅ **完整数据获取**：支持获取1-4级行政区划数据（省、地、县、乡）
-- ✅ **树形结构处理**：API返回树形结构，自动扁平化处理
-- ✅ **SQLite数据库**：数据存储到SQLite，支持批量操作和查询
-- ✅ **配置管理**：TOML格式配置文件，支持命令行参数覆盖
-- ✅ **多线程并发**：支持多线程获取乡级数据，提高效率
-- ✅ **错误处理**：完善的错误处理和重试机制
-- ✅ **进度显示**：详细的进度信息和统计摘要
-- ✅ **版本管理**：自动记录数据版本信息
+> 本项目已适配 `trimCode=true` 的“短码”语义：L1–L3 返回的是去尾 0 的短码，代码中不再对其做“去尾 0 归一化”。
+
+---
+
+## 你需要准备什么
+
+- Python 3.10+
+- 推荐使用 [uv](https://github.com/astral-sh/uv) 管理依赖（也可使用你自己的 venv/pip）
+
+---
 
 ## 安装
 
-```bash
-# 克隆项目
-git clone https://github.com/ByteColt/xzqh-crawler.git
-cd xzqh-crawler
+### 方式 A：使用 uv（推荐）
 
-# 安装依赖
-uv sync
-
-# 安装到虚拟环境
-uv pip install -e .
-```
-
-## 快速使用
-
-### 安装依赖
 ```bash
 uv sync
 ```
 
-### 基本使用
+### 方式 B：使用 pip（可选）
+
 ```bash
-# 创建默认配置文件
-python -m xzqh_crawler --create-config
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
+```
 
-# 使用默认配置运行爬虫（获取1-3级数据）
-python -m xzqh_crawler
+---
 
-# 使用自定义配置运行
-python -m xzqh_crawler --config ./config.toml --db-path ./data/xzqh.db --max-workers 10
+## 一键运行
 
-# 查看帮助
+抓取并写入一个新的 SQLite（包含 L1–L4）：
+
+```bash
+python -m xzqh_crawler --db-path ./data/xzqh.db
+```
+
+只抓取 L1–L3（不抓 L4）：
+
+```bash
+python -m xzqh_crawler --db-path ./data/xzqh_l1_l3.db --max-level 3
+```
+
+查看全部参数：
+
+```bash
 python -m xzqh_crawler --help
 ```
 
-### Python代码中使用
-```python
-from xzqh_crawler import XzqhCrawler
+---
 
-# 创建爬虫实例（获取完整数据）
-crawler = XzqhCrawler(
-    db_path="./data/xzqh.db",
-    fetch_townships=True,  # 获取乡级数据
-    max_workers=10,
-    batch_size=100,
-    township_batch_delay=2.0,  # 批次间延迟
-    township_max_retries=3,  # 最大重试次数
-)
+## 重要说明（L4 抓取策略）
 
-# 获取数据
-success = crawler.fetch_all()
-if success:
-    print("数据获取成功")
-    
-# 只获取1-3级数据（不获取乡级）
-crawler_simple = XzqhCrawler(
-    db_path="./data/xzqh_simple.db",
-    fetch_townships=False,  # 不获取乡级数据
-)
+`maxLevel=4` 时，接口允许用 **L2 或 L3** 作为 `code`：
+
+- 对很多省份：用 L2（例如 `4602`）请求 `maxLevel=4` 会直接返回该市下面的 L3 + L4。
+- 对直辖市等结构：需要对每个 L3（例如 `110101`）请求 `maxLevel=4`。
+
+本项目内部会根据库中的结构派发合适的 L4 抓取任务。
+
+---
+
+## 失败重试与断点续跑
+
+抓取 L4 时，程序会把“待抓取任务/已完成任务/失败任务”记录在 SQLite 里（表：`xzqh_jobs`），从而支持断点续跑。
+
+字段示例：
+- `status`: `pending | ok | failed`
+- `try_count`: 已尝试次数
+- `last_error`: 最近一次错误
+
+用法：
+- 运行过程中即使中断也没关系，之后**再次运行同一个 DB**，程序会继续处理未完成的任务，直到都变成 `ok`。
+
+---
+
+## 配置文件（可选）
+
+支持 TOML 配置（例如 `config.toml`），并允许命令行覆盖。
+
+```bash
+python -m xzqh_crawler --config ./config.toml --db-path ./data/xzqh.db
 ```
 
-### 数据库查询
-```python
-from xzqh_crawler import Database
+---
 
-db = Database(db_path="./data/xzqh.db")
+## 数据库结构（概览）
 
-# 查询统计信息
-stats = db.get_statistics()
-print(f"总记录数: {stats.get('total', 0)}")
+- `xzqh`
+  - 最小字段：`code, name, level, type, parent_code, name_path, created_at, updated_at`
+  - `type` 允许为空（例如根节点）
 
-# 查询省级数据
-provinces = db.get_divisions_by_level(1)
-for province in provinces[:5]:
-    print(f"{province.name} ({province.code})")
-```
+- `xzqh_jobs`
+  - 用于 L4 抓取任务的断点续跑/补跑
 
-## 配置
-
-创建 `config.toml` 文件：
-
-```toml
-[database]
-path = "./data/xzqh.db"
-
-[api]
-base_url = "https://dmfw.mca.gov.cn"
-timeout = 30
-max_retries = 3
-retry_delay = 1.0
-
-[crawler]
-max_workers = 10
-batch_size = 100
-fetch_townships = true  # 是否获取乡级数据
-township_batch_delay = 2.0  # 乡级数据批次间延迟（秒）
-township_max_retries = 3  # 乡级数据最大重试次数
-
-[logging]
-level = "INFO"
-```
-
-### 配置说明
-
-- **fetch_townships**: 是否获取乡级数据，默认为true
-- **township_batch_delay**: 乡级数据批次间延迟，避免API限制
-- **township_max_retries**: 乡级数据获取失败时的最大重试次数
-- **max_workers**: 并发工作线程数，用于获取乡级数据
-- **batch_size**: 批量处理大小，影响内存使用和性能
+---
 
 ## 项目结构
 
 ```
 xzqh-crawler/
-├── src/xzqh_crawler/
-│   ├── models.py      # 数据模型
-│   ├── client.py      # HTTP客户端
-│   ├── database.py    # 数据库操作
-│   ├── crawler.py     # 爬虫逻辑
-│   ├── config.py      # 配置管理
-│   ├── cli.py         # 命令行接口
-│   └── utils.py       # 工具函数
-├── docs/              # 文档
-├── pyproject.toml     # 项目配置
-└── README.md          # 项目说明
+  src/xzqh_crawler/
+  tests/
+  data/
+  docs/
+  pyproject.toml
+  README.md
 ```
 
-## 开发
+---
 
-```bash
-# 安装开发依赖
-uv sync --dev
+## 相关项目
 
-# 运行测试
-uv run pytest
-
-# 代码检查
-uv run ruff check src/
-
-# 代码格式化
-uv run black src/
-```
-
-## 许可证
-
-MIT
+- `address-picker`：前端地址选择器 Demo（消费本项目生成的 SQLite 快照）
