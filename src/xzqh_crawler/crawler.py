@@ -105,8 +105,6 @@ class XzqhCrawler:
             
             self.stats["end_time"] = datetime.now()
             self.stats["duration"] = self.stats["end_time"] - self.stats["start_time"]
-            self._print_summary()
-            
             logger.info("行政区划数据获取完成")
             return True
             
@@ -308,7 +306,7 @@ class XzqhCrawler:
                         # cleared by the final Live refresh on some terminals. So we also
                         # embed the hint into the panel itself (see reporter.set_footer).
                         if reporter is not None:
-                            reporter.set_footer("完成。按 Enter 退出…")
+                            reporter.set_footer("完成。按 Enter 显示摘要并退出…")
                             live.update(reporter.render(), refresh=True)
 
                         input()
@@ -316,6 +314,9 @@ class XzqhCrawler:
                         pass
 
                 live.__exit__(None, None, None)
+
+                # 打印摘要：放在 Live 退出后，避免被全屏模式清屏覆盖
+                self._print_summary()
     
     def _fetch_townships_batch(
         self,
