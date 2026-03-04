@@ -316,7 +316,7 @@ class XzqhCrawler:
                 live.__exit__(None, None, None)
 
                 # 打印摘要：放在 Live 退出后，避免被全屏模式清屏覆盖
-                self._print_summary()
+                self._print_summary_print()
     
     def _fetch_townships_batch(
         self,
@@ -500,3 +500,32 @@ class XzqhCrawler:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._cleanup()
+
+    def _print_summary_print(self):
+        """打印统计摘要（stdout）。
+
+        注意：progress 模式下会关闭 console logger（只写入 log_file），
+        所以不能用 logger.info 输出摘要，否则用户在终端看不到。
+        """
+        dur = self.stats.get("duration")
+        if not dur:
+            return
+
+        total_seconds = int(dur.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("数据获取统计摘要")
+        lines.append("=" * 60)
+        lines.append(f"省级行政区划: {self.stats.get('provinces', 0)} 个")
+        lines.append(f"地级行政区划: {self.stats.get('cities', 0)} 个")
+        lines.append(f"县级行政区划: {self.stats.get('counties', 0)} 个")
+        if self.fetch_townships:
+            lines.append(f"乡级行政区划: {self.stats.get('townships', 0)} 个")
+        lines.append(f"总数据量: {self.stats.get('total', 0)} 条")
+        lines.append(f"耗时: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        lines.append("=" * 60)
+
+        print("\n" + "\n".join(lines))
