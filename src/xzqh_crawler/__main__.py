@@ -90,6 +90,7 @@ def main():
         max_workers=config.max_workers,
         batch_size=config.batch_size,
         show_progress=args.progress,
+        wait_on_finish=args.progress,
     )
     
     if args.retry_failed:

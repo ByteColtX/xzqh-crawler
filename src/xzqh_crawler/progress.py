@@ -58,6 +58,7 @@ class ProgressReporter:
         self._total_ok = 0
         self._total_err = 0
         self._total_l4_nodes = 0
+        self._footer: str = ""
 
     @staticmethod
     def _province_key(parent_code: str) -> str:
@@ -111,6 +112,11 @@ class ProgressReporter:
 
         self.refresh()
 
+    def set_footer(self, text: str) -> None:
+        with self._lock:
+            self._footer = text
+        self.refresh()
+
     def render(self) -> Panel:
         with self._lock:
             by_prov = dict(self._by_province)
@@ -120,6 +126,7 @@ class ProgressReporter:
             total_err = self._total_err
             total_l4_nodes = self._total_l4_nodes
             start_ts = self._start_ts
+            footer = self._footer
 
         elapsed = max(0.001, time.time() - start_ts)
         rps = total_done / elapsed
@@ -167,7 +174,16 @@ class ProgressReporter:
         title = Text(
             f"乡级抓取进度 | total {total_done}/{total_queued} | inflight {in_flight}{workers} | ok {total_ok} err {total_err} | L4 +{total_l4_nodes} | {rps:.2f} req/s | {elapsed:.1f}s"
         )
-        return Panel(table, title=title, width=None, height=None, expand=True)
+
+        subtitle = Text(footer) if footer else None
+        return Panel(
+            table,
+            title=title,
+            subtitle=subtitle,
+            width=None,
+            height=None,
+            expand=True,
+        )
 
     def refresh(self) -> None:
         """If Live is attached, push an immediate refresh."""

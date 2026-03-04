@@ -28,6 +28,7 @@ class XzqhCrawler:
         township_batch_delay: float = 2.0,
         township_max_retries: int = 3,
         show_progress: bool = True,
+        wait_on_finish: bool = True,
     ):
         """
         初始化爬虫
@@ -49,6 +50,7 @@ class XzqhCrawler:
         self.township_batch_delay = township_batch_delay
         self.township_max_retries = township_max_retries
         self.show_progress = show_progress
+        self.wait_on_finish = wait_on_finish
         
         self.client: Optional[XzqhClient] = None
         self.db: Optional[Database] = None
@@ -298,6 +300,21 @@ class XzqhCrawler:
             if live is not None:
                 # final refresh
                 live.update(reporter.render() if reporter else "")
+
+                # Keep the panel on screen until user confirms.
+                if self.wait_on_finish:
+                    try:
+                        # NOTE: with Live(screen=True), printing to console here may be
+                        # cleared by the final Live refresh on some terminals. So we also
+                        # embed the hint into the panel itself (see reporter.set_footer).
+                        if reporter is not None:
+                            reporter.set_footer("完成。按 Enter 退出…")
+                            live.update(reporter.render(), refresh=True)
+
+                        input()
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+
                 live.__exit__(None, None, None)
     
     def _fetch_townships_batch(
