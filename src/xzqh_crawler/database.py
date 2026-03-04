@@ -85,17 +85,6 @@ class Database:
             # short-code compatibility (older DBs may already exist)
             cursor.execute("PRAGMA foreign_keys = ON")
 
-            # 创建数据版本表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS data_versions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    version_code VARCHAR(20) UNIQUE,
-                    data_year INTEGER,
-                    record_count INTEGER,
-                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_level ON xzqh(level)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_parent_code ON xzqh(parent_code)")
@@ -445,71 +434,6 @@ class Database:
             logger.error(f"获取统计信息失败: {e}")
             return {}
     
-    def save_version_info(
-        self, 
-        version_code: str, 
-        data_year: int, 
-        record_count: int
-    ) -> bool:
-        """
-        保存数据版本信息
-        
-        Args:
-            version_code: 版本标识
-            data_year: 数据年份
-            record_count: 记录数
-            
-        Returns:
-            是否成功
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-
-                cursor.execute("""
-                    INSERT INTO data_versions (version_code, data_year, record_count)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(version_code) DO UPDATE SET
-                        data_year = excluded.data_year,
-                        record_count = excluded.record_count,
-                        fetched_at = CURRENT_TIMESTAMP
-                """, (version_code, data_year, record_count))
-
-                self.conn.commit()
-
-            logger.info(f"保存版本信息: {version_code}, 记录数: {record_count}")
-            return True
-            
-        except sqlite3.Error as e:
-            logger.error(f"保存版本信息失败: {e}")
-            with self._lock:
-                self.conn.rollback()
-            return False
-    
-    def get_latest_version(self) -> Optional[Dict[str, Any]]:
-        """
-        获取最新版本信息
-        
-        Returns:
-            版本信息字典，如果不存在则返回None
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute("""
-                    SELECT * FROM data_versions 
-                    ORDER BY fetched_at DESC 
-                    LIMIT 1
-                """)
-                row = cursor.fetchone()
-
-            if row:
-                return dict(row)
-            return None
-            
-        except sqlite3.Error as e:
-            logger.error(f"获取最新版本失败: {e}")
-            return None
     
     def _row_to_division(self, row: sqlite3.Row) -> AdministrativeDivision:
         """将数据库行转换为行政区划对象"""

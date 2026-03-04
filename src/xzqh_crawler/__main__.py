@@ -100,6 +100,44 @@ def main():
     
     if success:
         print("\n✅ 数据获取完成！")
+
+        # progress 模式下默认关闭 console logger（仅写入 --log-file），
+        # 因此这里强制使用 stdout 输出一个最小统计摘要，确保用户能看见。
+        try:
+            from collections import Counter
+            from .database import Database
+
+            db = Database(db_path=config.db_path)
+            stats = db.get_statistics() or {}
+
+            # 仅为了计数，分别按 status 查询（避免改动 database API）
+            job_status_counts: Counter[str] = Counter()
+            job_status_counts["ok"] = len(db.list_level4_jobs_by_status(["ok"]))
+            job_status_counts["failed"] = len(db.list_level4_jobs_by_status(["failed"]))
+            job_status_counts["pending"] = len(db.list_level4_jobs_by_status(["pending"]))
+
+            level_counts = {
+                int(k.split("_")[1]): v for k, v in stats.items() if k.startswith("level_")
+            }
+
+            lines = []
+            lines.append("=" * 60)
+            lines.append("统计摘要")
+            lines.append("=" * 60)
+            lines.append(f"DB: {config.db_path}")
+            lines.append(f"总行数: {stats.get('total', 0)}")
+            if level_counts:
+                lines.append(f"Level 分布: {dict(sorted(level_counts.items()))}")
+            lines.append(
+                "Jobs(level4) 状态: "
+                + f"ok={job_status_counts['ok']} failed={job_status_counts['failed']} pending={job_status_counts['pending']}"
+            )
+            lines.append("=" * 60)
+            print("\n" + "\n".join(lines))
+        except Exception:
+            # 摘要失败不影响主流程
+            pass
+
         sys.exit(0)
     else:
         print("\n❌ 数据获取失败！")

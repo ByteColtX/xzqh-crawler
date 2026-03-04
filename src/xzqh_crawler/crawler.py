@@ -100,9 +100,6 @@ class XzqhCrawler:
             else:
                 logger.info("跳过乡级数据获取")
             
-            # 3. 保存版本信息
-            self._save_version_info()
-            
             self.stats["end_time"] = datetime.now()
             self.stats["duration"] = self.stats["end_time"] - self.stats["start_time"]
             logger.info("行政区划数据获取完成")
@@ -315,8 +312,6 @@ class XzqhCrawler:
 
                 live.__exit__(None, None, None)
 
-                # 打印摘要：放在 Live 退出后，避免被全屏模式清屏覆盖
-                self._print_summary_print()
     
     def _fetch_townships_batch(
         self,
@@ -436,49 +431,6 @@ class XzqhCrawler:
 
         return []
     
-    def _save_version_info(self):
-        """保存版本信息"""
-        try:
-            # 获取总记录数
-            stats = self.db.get_statistics()
-            total_count = stats.get("total", 0)
-            
-            # 生成版本标识（使用当前时间）
-            version_code = datetime.now().strftime("%Y%m%d_%H%M%S")
-            data_year = datetime.now().year
-            
-            # 保存版本信息
-            self.db.save_version_info(
-                version_code=version_code,
-                data_year=data_year,
-                record_count=total_count,
-            )
-            
-            logger.info(f"版本信息已保存: {version_code}, 总记录数: {total_count}")
-            
-        except Exception:
-            logger.exception("保存版本信息失败")
-    
-    def _print_summary(self):
-        """打印统计摘要"""
-        if self.stats["duration"]:
-            total_seconds = self.stats["duration"].total_seconds()
-            hours, remainder = divmod(total_seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            
-            logger.info("=" * 60)
-            logger.info("数据获取统计摘要")
-            logger.info("=" * 60)
-            logger.info(f"省级行政区划: {self.stats['provinces']} 个")
-            logger.info(f"地级行政区划: {self.stats['cities']} 个")
-            logger.info(f"县级行政区划: {self.stats['counties']} 个")
-            
-            if self.fetch_townships:
-                logger.info(f"乡级行政区划: {self.stats['townships']} 个")
-            
-            logger.info(f"总数据量: {self.stats['total']} 条")
-            logger.info(f"耗时: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-            logger.info("=" * 60)
     
     def _cleanup(self):
         """清理资源"""
@@ -501,31 +453,3 @@ class XzqhCrawler:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._cleanup()
 
-    def _print_summary_print(self):
-        """打印统计摘要（stdout）。
-
-        注意：progress 模式下会关闭 console logger（只写入 log_file），
-        所以不能用 logger.info 输出摘要，否则用户在终端看不到。
-        """
-        dur = self.stats.get("duration")
-        if not dur:
-            return
-
-        total_seconds = int(dur.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-
-        lines = []
-        lines.append("=" * 60)
-        lines.append("数据获取统计摘要")
-        lines.append("=" * 60)
-        lines.append(f"省级行政区划: {self.stats.get('provinces', 0)} 个")
-        lines.append(f"地级行政区划: {self.stats.get('cities', 0)} 个")
-        lines.append(f"县级行政区划: {self.stats.get('counties', 0)} 个")
-        if self.fetch_townships:
-            lines.append(f"乡级行政区划: {self.stats.get('townships', 0)} 个")
-        lines.append(f"总数据量: {self.stats.get('total', 0)} 条")
-        lines.append(f"耗时: {hours:02d}:{minutes:02d}:{seconds:02d}")
-        lines.append("=" * 60)
-
-        print("\n" + "\n".join(lines))
