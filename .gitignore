@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+
+# Pytest
+.pytest_cache/
+pytest-of-*/
+
+# SQLite / local data
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
