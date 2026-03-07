@@ -1,62 +1,43 @@
 # xzqh-crawler（行政区划数据爬虫）
 
-从民政部「全国行政区划信息查询平台」接口抓取 1–4 级行政区划数据，并落库到 SQLite。
+从民政部[「全国行政区划信息查询平台」](https://dmfw.mca.gov.cn/XzqhVersionPublish.html)接口抓取 1–4 级行政区划数据，并落库到 SQLite。
 
 - 数据层级：
   - L1 省/直辖市/自治区
   - L2 地级市/地区/自治州
   - L3 区县
   - L4 乡镇/街道
+  - 暂无 L5（村/社区）数据
 - 数据源接口：`https://dmfw.mca.gov.cn/xzqh/getList?code=...&trimCode=true&maxLevel=...`
-- 输出：SQLite（默认写入 `data/`）
-
-> 本项目已适配 `trimCode=true` 的“短码”语义：L1–L3 返回的是去尾 0 的短码，代码中不再对其做“去尾 0 归一化”。
+- 输出：SQLite3 数据库，表名 `xzqh`
+- 本项目数据已更新至: [2025-12-31](./data/xzqh_20251231.db)
 
 ---
 
 ## 你需要准备什么
 
 - Python 3.10+
-- 推荐使用 [uv](https://github.com/astral-sh/uv) 管理依赖（也可使用你自己的 venv/pip）
+- 推荐使用 [uv](https://github.com/astral-sh/uv) 管理依赖
 
 ---
 
-## 安装
+## 快速开始
 
-### 方式 A：使用 uv（推荐）
+### 使用 uv（推荐）
 
 ```bash
+git clone https://github.com/ByteColtX/xzqh-crawler.git
+cd xzqh-crawler
 uv sync
+uv run python -m xzqh_crawler --db-path ./data/xzqh.db
 ```
 
-### 方式 B：使用 pip（可选）
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -e .
-```
-
----
-
-## 一键运行
-
-抓取并写入一个新的 SQLite（包含 L1–L4）：
-
-```bash
-python -m xzqh_crawler --db-path ./data/xzqh.db
-```
-
-只抓取 L1–L3（不抓 L4）：
-
-```bash
-python -m xzqh_crawler --db-path ./data/xzqh_l1_l3.db --max-level 3
-```
+如不使用 uv，也可自行创建 venv 后执行 `pip install -e .`。
 
 查看全部参数：
 
 ```bash
-python -m xzqh_crawler --help
+uv run python -m xzqh_crawler --help
 ```
 
 ---
@@ -67,8 +48,6 @@ python -m xzqh_crawler --help
 
 - 对很多省份：用 L2（例如 `4602`）请求 `maxLevel=4` 会直接返回该市下面的 L3 + L4。
 - 对直辖市等结构：需要对每个 L3（例如 `110101`）请求 `maxLevel=4`。
-
-本项目内部会根据库中的结构派发合适的 L4 抓取任务。
 
 ---
 
@@ -82,19 +61,38 @@ python -m xzqh_crawler --help
 - `last_error`: 最近一次错误
 
 用法：
-- 运行过程中即使中断也没关系，之后**再次运行同一个 DB**，程序会继续处理未完成的任务，直到都变成 `ok`。
+- 运行过程中即使中断也没关系。
+- 再次运行同一个 DB 时，程序会继续处理 `xzqh_jobs` 中的 `pending` / `failed` 任务，无需依赖额外失败文件。
 
 ---
 
 ## 配置文件（可选）
 
-支持 TOML 配置（例如 `config.toml`），并允许命令行覆盖。
+支持 TOML 配置（例如 `config.toml`），并允许命令行参数覆盖配置文件中的默认值。
 
 ```bash
 python -m xzqh_crawler --config ./config.toml --db-path ./data/xzqh.db
 ```
 
+具体可用参数请以 `--help` 和源码中的配置模型为准。
+
 ---
+
+## 数据说明
+
+统计用区划代码由1～12位代码构成，其各代码表示为：  
+第1～2位，为省级代码；  
+第3～4 位，为地级代码；  
+第5～6位，为县级代码；  
+第7～9位，为乡级代码；  
+第10～12位，为村级代码；  
+
+示例：
+- 省级数据(L1): 广东（44）
+- 地市级数据(L2): 广州市（4401）
+- 区县级数据(L3): 越秀区（440104）
+- 乡镇级数据(L4): 白云街道（440104020）
+- 村/社区(L5): **本项目暂无**
 
 ## 数据库结构（概览）
 
@@ -105,22 +103,4 @@ python -m xzqh_crawler --config ./config.toml --db-path ./data/xzqh.db
 - `xzqh_jobs`
   - 用于 L4 抓取任务的断点续跑/补跑
 
----
-
-## 项目结构
-
-```
-xzqh-crawler/
-  src/xzqh_crawler/
-  tests/
-  data/
-  docs/
-  pyproject.toml
-  README.md
-```
-
----
-
-## 相关项目
-
-- `address-picker`：前端地址选择器 Demo（消费本项目生成的 SQLite 快照）
+## 许可证：MIT License
