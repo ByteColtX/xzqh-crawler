@@ -1,6 +1,8 @@
 # xzqh-crawler
 
-从民政部[「全国行政区划信息查询平台」](https://dmfw.mca.gov.cn/XzqhVersionPublish.html)接口抓取 1-4 级行政区划数据，并写入 SQLite。
+从民政部[「全国行政区划信息查询平台」](https://dmfw.mca.gov.cn/XzqhVersionPublish.html)接口抓取中国 1-4 级行政区划代码和地址基础数据，并写入 SQLite。
+
+可直接用作行政区划库、地址库基础表，适合省市区街道级联地址选择、地址补全、地址标准化前置字典和地理数据清洗。
 
 当前实现是纯异步批处理工具：
 
