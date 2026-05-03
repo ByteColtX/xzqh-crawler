@@ -1,200 +1,242 @@
-"""数据库操作模块"""
+"""异步数据库访问模块。"""
 
-import sqlite3
+from __future__ import annotations
+
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+
+import aiosqlite
 
 from .models import AdministrativeDivision
 
 logger = logging.getLogger(__name__)
 
 
-class Database:
-    """数据库操作类"""
+@dataclass(slots=True, frozen=True)
+class CrawlJobWrite:
+    """单个抓取任务的落库结果。"""
 
-    def __init__(self, db_path: str = "./data/xzqh.db"):
-        """初始化数据库
+    parent_code: str
+    state: str
+    divisions: tuple[AdministrativeDivision, ...] = ()
+    last_error: str | None = None
+
+
+class Database:
+    """SQLite 异步访问封装。"""
+
+    def __init__(self, db_path: str = "./data/xzqh.db") -> None:
+        """初始化数据库对象。
 
         Args:
-            db_path: 数据库文件路径
+            db_path: SQLite 文件路径。
         """
-        import threading
-
-        # SQLite connection is shared by multiple worker threads in this project.
-        # Serialize access to avoid races.
-        self._lock = threading.RLock()
-
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: aiosqlite.Connection | None = None
 
-        self.conn: Optional[sqlite3.Connection] = None
-        self._init_database()
-    
-    def _init_database(self):
-        """初始化数据库表结构"""
-        try:
-            # Allow using the same connection object across worker threads.
-            # We still need to ensure DB operations are serialized at a higher level.
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row
-            
-            # 创建表
-            self._create_tables()
-            logger.info(f"数据库初始化完成: {self.db_path}")
-            
-        except sqlite3.Error as e:
-            logger.error(f"数据库初始化失败: {e}")
-            raise
-    
-    def _create_tables(self):
-        """创建数据库表"""
-        with self._lock:
-            cursor = self.conn.cursor()
+    async def __aenter__(self) -> Database:
+        """进入异步上下文。"""
+        await self.open()
+        return self
 
-            # 创建行政区划主表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS xzqh (
-                    code TEXT PRIMARY KEY,
-                    name TEXT,
-                    level INTEGER NOT NULL,
-                    type TEXT,
-                    parent_code TEXT,
-                    parent_name TEXT,
-                    name_path TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+    async def __aexit__(self, exc_type: object, exc: object, exc_tb: object) -> None:
+        """退出异步上下文。"""
+        await self.close()
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS xzqh_jobs (
-                    code TEXT PRIMARY KEY,
-                    max_level INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    try_count INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+    async def open(self) -> None:
+        """打开数据库连接并初始化表结构。"""
+        if self._conn is not None:
+            return
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_jobs_status ON xzqh_jobs(status)")
+        self._conn = await aiosqlite.connect(self.db_path)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA journal_mode = WAL")
+        await self._conn.execute("PRAGMA synchronous = NORMAL")
+        await self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS divisions (
+                code TEXT PRIMARY KEY,
+                name TEXT,
+                level INTEGER NOT NULL,
+                type TEXT,
+                parent_code TEXT,
+                parent_name TEXT,
+                name_path TEXT,
+                fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
 
-            # short-code compatibility (older DBs may already exist)
-            cursor.execute("PRAGMA foreign_keys = ON")
+            CREATE INDEX IF NOT EXISTS idx_divisions_level
+            ON divisions(level);
 
-            # 创建索引
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_level ON xzqh(level)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_parent_code ON xzqh(parent_code)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_xzqh_name ON xzqh(name)")
+            CREATE INDEX IF NOT EXISTS idx_divisions_parent_code
+            ON divisions(parent_code);
 
-            self.conn.commit()
-            logger.debug("数据库表创建完成")
-    
-    def save_division(self, division: AdministrativeDivision) -> bool:
-        """
-        保存或更新行政区划数据
-        
+            CREATE TABLE IF NOT EXISTS crawl_jobs (
+                parent_code TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_crawl_jobs_state
+            ON crawl_jobs(state);
+            """,
+        )
+        await self._conn.commit()
+
+    async def close(self) -> None:
+        """关闭数据库连接。"""
+        if self._conn is None:
+            return
+        await self._conn.close()
+        self._conn = None
+
+    async def save_divisions(self, divisions: Sequence[AdministrativeDivision]) -> int:
+        """批量写入行政区划记录。
+
         Args:
-            division: 行政区划对象
-            
+            divisions: 待保存的行政区划记录列表。
+
         Returns:
-            是否成功
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-            
-            # 检查是否已存在
-            cursor.execute("SELECT 1 FROM xzqh WHERE code = ?", (division.code,))
-            exists = cursor.fetchone() is not None
-            
-            if exists:
-                # 更新数据
-                cursor.execute("""
-                    UPDATE xzqh SET
-                        name = ?,
-                        level = ?,
-                        type = ?,
-                        parent_code = ?,
-                        parent_name = ?,
-                        name_path = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE code = ?
-                """, (
-                    division.name,
-                    division.level,
-                    division.type,
-                    division.parent_code,
-                    division.parent_name,
-                    division.name_path,
-                    division.code,
-                ))
-            else:
-                # 插入新数据
-                cursor.execute("""
-                    INSERT INTO xzqh (
-                        code, name, level, type,
-                        parent_code, parent_name, name_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    division.code,
-                    division.name,
-                    division.level,
-                    division.type,
-                    division.parent_code,
-                    division.parent_name,
-                    division.name_path,
-                ))
-            
-            with self._lock:
-                self.conn.commit()
-            logger.debug(f"{'更新' if exists else '插入'}行政区划数据: {division.code} - {division.name}")
-            return True
-            
-        except sqlite3.Error as e:
-            logger.error(f"保存行政区划数据失败: {e}, 数据: {division}")
-            with self._lock:
-                self.conn.rollback()
-            return False
-    
-    def save_divisions_batch(self, divisions: List[AdministrativeDivision]) -> int:
-        """
-        批量保存行政区划数据
-        
-        Args:
-            divisions: 行政区划对象列表
-            
-        Returns:
-            成功保存的数量
+            int: 实际提交的记录数。
         """
         if not divisions:
             return 0
-        
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                success_count = 0
-            
-            for division in divisions:
-                try:
-                    # 使用UPSERT语法（SQLite 3.24+）
-                    cursor.execute("""
-                        INSERT INTO xzqh (
-                            code, name, level, type,
-                            parent_code, parent_name, name_path
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(code) DO UPDATE SET
-                            name = excluded.name,
-                            level = excluded.level,
-                            type = excluded.type,
-                            parent_code = excluded.parent_code,
-                            parent_name = excluded.parent_name,
-                            name_path = excluded.name_path,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, (
+
+        filtered_divisions = self._filter_numeric_code_divisions(divisions)
+        if not filtered_divisions:
+            return 0
+
+        conn = self._require_connection()
+        rows = [
+            (
+                division.code,
+                division.name,
+                division.level,
+                division.type,
+                division.parent_code,
+                division.parent_name,
+                division.name_path,
+            )
+            for division in filtered_divisions
+        ]
+        await conn.executemany(
+            """
+            INSERT INTO divisions (
+                code,
+                name,
+                level,
+                type,
+                parent_code,
+                parent_name,
+                name_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                name = excluded.name,
+                level = excluded.level,
+                type = excluded.type,
+                parent_code = excluded.parent_code,
+                parent_name = excluded.parent_name,
+                name_path = excluded.name_path,
+                fetched_at = CURRENT_TIMESTAMP
+            """,
+            rows,
+        )
+        await conn.commit()
+        return len(rows)
+
+    async def get_division(self, code: str) -> AdministrativeDivision | None:
+        """根据代码查询单条行政区划记录。"""
+        conn = self._require_connection()
+        async with conn.execute(
+            "SELECT * FROM divisions WHERE code = ?",
+            (code,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_division(row) if row else None
+
+    async def get_parent_codes_for_townships(self) -> list[str]:
+        """查询需要补抓 L4 的父节点代码。"""
+        conn = self._require_connection()
+        async with conn.execute(
+            """
+            SELECT code
+            FROM divisions
+            WHERE level IN (2, 3)
+              AND parent_code IN (SELECT code FROM divisions WHERE level = 1)
+            ORDER BY code
+            """,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [str(row["code"]) for row in rows]
+
+    async def ensure_crawl_jobs(self, parent_codes: Sequence[str]) -> int:
+        """确保抓取任务存在。"""
+        if not parent_codes:
+            return 0
+
+        conn = self._require_connection()
+        before = conn.total_changes
+        await conn.executemany(
+            """
+            INSERT OR IGNORE INTO crawl_jobs (
+                parent_code,
+                state,
+                retry_count,
+                last_error,
+                updated_at
+            ) VALUES (?, 'pending', 0, NULL, CURRENT_TIMESTAMP)
+            """,
+            [(code,) for code in parent_codes],
+        )
+        await conn.commit()
+        return conn.total_changes - before
+
+    async def list_crawl_jobs(self, states: Sequence[str]) -> list[str]:
+        """按状态列出待抓取任务。"""
+        if not states:
+            return []
+
+        placeholders = ",".join("?" for _ in states)
+        conn = self._require_connection()
+        async with conn.execute(
+            f"""
+            SELECT parent_code
+            FROM crawl_jobs
+            WHERE state IN ({placeholders})
+            ORDER BY parent_code
+            """,
+            list(states),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [str(row["parent_code"]) for row in rows]
+
+    async def apply_crawl_job_writes(self, writes: Sequence[CrawlJobWrite]) -> int:
+        """批量提交抓取结果。
+
+        Args:
+            writes: 已完成的抓取任务结果。
+
+        Returns:
+            int: 写入到 `divisions` 表中的记录数。
+        """
+        if not writes:
+            return 0
+
+        conn = self._require_connection()
+        division_rows: list[tuple[str, str | None, int, str | None, str | None, str | None, str | None]] = []
+        ok_codes: list[tuple[str]] = []
+        failed_rows: list[tuple[str | None, str]] = []
+
+        for write in writes:
+            if write.state == "ok":
+                ok_codes.append((write.parent_code,))
+                division_rows.extend(
+                    (
                         division.code,
                         division.name,
                         division.level,
@@ -202,259 +244,146 @@ class Database:
                         division.parent_code,
                         division.parent_name,
                         division.name_path,
-                    ))
-                    success_count += 1
-                    
-                except sqlite3.Error as e:
-                    logger.warning(f"批量保存单个数据失败: {e}, 代码: {division.code}")
-                    continue
-            
-            with self._lock:
-                self.conn.commit()
-            logger.info(f"批量保存完成: {success_count}/{len(divisions)} 条数据")
-            return success_count
-            
-        except sqlite3.Error as e:
-            logger.error(f"批量保存数据失败: {e}")
-            with self._lock:
-                self.conn.rollback()
-            return 0
-    
-    def get_division(self, code: str) -> Optional[AdministrativeDivision]:
-        """
-        根据代码获取行政区划数据
-        
-        Args:
-            code: 行政区划代码
-            
-        Returns:
-            行政区划对象，如果不存在则返回None
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT * FROM xzqh WHERE code = ?", (code,))
-                row = cursor.fetchone()
-            
-            if row:
-                return self._row_to_division(row)
-            return None
-            
-        except sqlite3.Error as e:
-            logger.error(f"查询行政区划数据失败: {e}, 代码: {code}")
-            return None
-    
-    def get_divisions_by_level(self, level: int) -> List[AdministrativeDivision]:
-        """
-        根据层级获取行政区划数据
-        
-        Args:
-            level: 层级 (1-4)
-            
-        Returns:
-            行政区划对象列表
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT * FROM xzqh WHERE level = ? ORDER BY code", (level,))
-                rows = cursor.fetchall()
-
-            return [self._row_to_division(row) for row in rows]
-            
-        except sqlite3.Error as e:
-            logger.error(f"查询层级数据失败: {e}, 层级: {level}")
-            return []
-    
-    def get_county_codes(self) -> List[str]:
-        """获取所有县级行政区划代码（兼容旧逻辑）"""
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT code FROM xzqh WHERE level = 3 ORDER BY code")
-                rows = cursor.fetchall()
-            return [row["code"] for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"获取县级代码失败: {e}")
-            return []
-
-    def get_parent_codes_for_townships(self) -> List[str]:
-        """获取需要请求 maxLevel=4 的父节点 code（适配新接口语义）。
-
-        规则：对每个省(L1)的直接子节点：
-        - 如果子节点是 L2：请求该 L2 一次（覆盖其下全部 L3+L4）
-        - 如果子节点是 L3：请求该 L3 一次（覆盖其下 L4；用于直辖市/省直管县级市等混合结构）
-
-        这样可正确处理海南这种 L1 下既有 L2 又有 L3 的情况。
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT code
-                    FROM xzqh
-                    WHERE level IN (2, 3)
-                      AND parent_code IN (SELECT code FROM xzqh WHERE level = 1)
-                    ORDER BY code
-                    """
+                    )
+                    for division in self._filter_numeric_code_divisions(write.divisions)
                 )
-                rows = cursor.fetchall()
-            return [row["code"] for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"获取乡级父节点代码失败: {e}")
-            return []
+            else:
+                failed_rows.append(
+                    ((write.last_error or "未知错误")[:500], write.parent_code),
+                )
 
-    def ensure_level4_jobs(self, codes: List[str]) -> int:
-        """确保给定 codes 都在 jobs 表中（max_level 固定为 4）。
-
-        新增的 job 状态为 pending；已存在则忽略。
-
-        Returns:
-            新插入的 job 数量（best-effort）
-        """
-        if not codes:
-            return 0
-
-        now = datetime.now().isoformat(timespec="seconds")
-        rows = [(str(code), 4, "pending", 0, None, now, now) for code in codes]
-
+        await conn.execute("BEGIN")
         try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.executemany(
+            if division_rows:
+                await conn.executemany(
                     """
-                    INSERT OR IGNORE INTO xzqh_jobs
-                      (code, max_level, status, try_count, last_error, updated_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO divisions (
+                        code,
+                        name,
+                        level,
+                        type,
+                        parent_code,
+                        parent_name,
+                        name_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(code) DO UPDATE SET
+                        name = excluded.name,
+                        level = excluded.level,
+                        type = excluded.type,
+                        parent_code = excluded.parent_code,
+                        parent_name = excluded.parent_name,
+                        name_path = excluded.name_path,
+                        fetched_at = CURRENT_TIMESTAMP
                     """,
-                    rows,
+                    division_rows,
                 )
-                inserted = cursor.rowcount
-                self.conn.commit()
-            return max(inserted, 0)
-        except sqlite3.Error as e:
-            logger.error(f"创建 level4 jobs 失败: {e}")
-            with self._lock:
-                self.conn.rollback()
-            return 0
 
-    def list_level4_jobs_by_status(self, statuses: List[str]) -> List[str]:
-        """按状态列出 jobs code（max_level=4）。"""
-        if not statuses:
-            return []
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                qs = ",".join(["?"] * len(statuses))
-                cursor.execute(
-                    f"""
-                    SELECT code FROM xzqh_jobs
-                    WHERE max_level=4 AND status IN ({qs})
-                    ORDER BY code
-                    """,
-                    statuses,
-                )
-                rows = cursor.fetchall()
-            return [row["code"] for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"查询 level4 jobs 失败: {e}")
-            return []
-
-    def mark_level4_job_ok(self, code: str) -> None:
-        """将 job 标记为 ok。"""
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute(
+            if ok_codes:
+                await conn.executemany(
                     """
-                    UPDATE xzqh_jobs
-                    SET status='ok', updated_at=CURRENT_TIMESTAMP
-                    WHERE code=? AND max_level=4
+                    UPDATE crawl_jobs
+                    SET state = 'ok',
+                        last_error = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE parent_code = ?
                     """,
-                    (str(code),),
+                    ok_codes,
                 )
-                self.conn.commit()
-        except sqlite3.Error as e:
-            logger.error(f"更新 job ok 失败: {e}")
-            with self._lock:
-                self.conn.rollback()
 
-    def mark_level4_job_failed(self, code: str, error: str) -> None:
-        """将 job 标记为 failed，try_count+1，记录 last_error。"""
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                cursor.execute(
+            if failed_rows:
+                await conn.executemany(
                     """
-                    UPDATE xzqh_jobs
-                    SET status='failed',
-                        try_count=try_count+1,
-                        last_error=?,
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE code=? AND max_level=4
+                    UPDATE crawl_jobs
+                    SET state = 'failed',
+                        retry_count = retry_count + 1,
+                        last_error = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE parent_code = ?
                     """,
-                    (error[:500], str(code)),
+                    failed_rows,
                 )
-                self.conn.commit()
-        except sqlite3.Error as e:
-            logger.error(f"更新 job failed 失败: {e}")
-            with self._lock:
-                self.conn.rollback()
-    
-    def get_statistics(self) -> Dict[str, int]:
-        """
-        获取数据统计信息
-        
-        Returns:
-            统计信息字典
-        """
-        try:
-            with self._lock:
-                cursor = self.conn.cursor()
-                stats = {}
 
-                # 按层级统计
-                cursor.execute("""
-                    SELECT level, COUNT(*) as count 
-                    FROM xzqh 
-                    GROUP BY level 
-                    ORDER BY level
-                """)
-                for row in cursor.fetchall():
-                    stats[f"level_{row['level']}"] = row["count"]
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
 
-                # 总记录数
-                cursor.execute("SELECT COUNT(*) as total FROM xzqh")
-                stats["total"] = cursor.fetchone()["total"]
+        return len(division_rows)
 
-                return stats
-            
-        except sqlite3.Error as e:
-            logger.error(f"获取统计信息失败: {e}")
-            return {}
-    
-    
-    def _row_to_division(self, row: sqlite3.Row) -> AdministrativeDivision:
-        """将数据库行转换为行政区划对象"""
+    async def get_statistics(self) -> dict[str, int]:
+        """返回分层统计信息。"""
+        conn = self._require_connection()
+        stats: dict[str, int] = {}
+        async with conn.execute(
+            """
+            SELECT level, COUNT(*) AS count
+            FROM divisions
+            GROUP BY level
+            ORDER BY level
+            """,
+        ) as cursor:
+            async for row in cursor:
+                stats[f"level_{row['level']}"] = int(row["count"])
+
+        async with conn.execute("SELECT COUNT(*) AS total FROM divisions") as cursor:
+            row = await cursor.fetchone()
+        stats["total"] = int(row["total"]) if row else 0
+        return stats
+
+    async def get_crawl_job_counts(self) -> dict[str, int]:
+        """返回任务状态统计。"""
+        conn = self._require_connection()
+        counts = {"pending": 0, "ok": 0, "failed": 0}
+        async with conn.execute(
+            """
+            SELECT state, COUNT(*) AS count
+            FROM crawl_jobs
+            GROUP BY state
+            """,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            counts[str(row["state"])] = int(row["count"])
+        return counts
+
+    def _require_connection(self) -> aiosqlite.Connection:
+        """返回已建立的连接。"""
+        if self._conn is None:
+            raise RuntimeError("数据库尚未打开")
+        return self._conn
+
+    def _row_to_division(self, row: aiosqlite.Row) -> AdministrativeDivision:
+        """把查询结果转换成数据模型。"""
         return AdministrativeDivision(
-            code=row["code"],
+            code=str(row["code"]),
             name=row["name"],
-            level=row["level"],
+            level=int(row["level"]),
             type=row["type"],
             parent_code=row["parent_code"],
             parent_name=row["parent_name"],
             name_path=row["name_path"],
         )
-    
-    def close(self):
-        """关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
-            logger.debug("数据库连接已关闭")
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+
+    def _filter_numeric_code_divisions(
+        self,
+        divisions: Sequence[AdministrativeDivision],
+    ) -> list[AdministrativeDivision]:
+        """过滤 `code` 非数字的脏数据。
+
+        Args:
+            divisions: 待落库的行政区划记录。
+
+        Returns:
+            list[AdministrativeDivision]: 仅包含数字代码的记录。
+        """
+        valid_divisions: list[AdministrativeDivision] = []
+        for division in divisions:
+            if division.code and division.code.isdigit():
+                valid_divisions.append(division)
+                continue
+            logger.debug(
+                "跳过非数字 code 的行政区划记录: code=%r name=%r",
+                division.code,
+                division.name,
+            )
+        return valid_divisions

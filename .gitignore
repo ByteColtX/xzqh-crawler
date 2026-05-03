@@ -10,6 +10,9 @@ __pycache__/
 .pytest_cache/
 pytest-of-*/
 
+# Ruff
+.ruff_cache/
+
 # SQLite / local data
 *.db
 *.sqlite

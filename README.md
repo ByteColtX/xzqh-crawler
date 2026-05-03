@@ -1,106 +1,116 @@
-# xzqh-crawler（行政区划数据爬虫）
+# xzqh-crawler
 
-从民政部[「全国行政区划信息查询平台」](https://dmfw.mca.gov.cn/XzqhVersionPublish.html)接口抓取 1–4 级行政区划数据，并落库到 SQLite。
+从民政部[「全国行政区划信息查询平台」](https://dmfw.mca.gov.cn/XzqhVersionPublish.html)接口抓取 1-4 级行政区划数据，并写入 SQLite。
 
-- 数据层级：
-  - L1 省/直辖市/自治区
-  - L2 地级市/地区/自治州
-  - L3 区县
-  - L4 乡镇/街道
-  - 暂无 L5（村/社区）数据
-- 数据源接口：`https://dmfw.mca.gov.cn/xzqh/getList?code=...&trimCode=true&maxLevel=...`
-- 输出：SQLite3 数据库，表名 `xzqh`
-- 本项目数据已更新至: [2025-12-31](./data/xzqh_20251231.db)
+当前实现是纯异步批处理工具：
 
----
+- HTTP：`aiohttp`
+- 数据库：`aiosqlite`
+- 并发模型：`asyncio.Queue + 固定 worker + 单 writer`
+- 终端输出：普通日志 + 最终摘要
 
-## 你需要准备什么
+## 运行要求
 
-- Python 3.10+
-- 推荐使用 [uv](https://github.com/astral-sh/uv) 管理依赖
+- Python 3.12+
+- 推荐使用 [uv](https://github.com/astral-sh/uv)
 
----
-
-## 快速开始
-
-### 使用 uv（推荐）
+## 安装
 
 ```bash
 git clone https://github.com/ByteColtX/xzqh-crawler.git
 cd xzqh-crawler
 uv sync
-uv run python -m xzqh_crawler --db-path ./data/xzqh.db
 ```
 
-如不使用 uv，也可自行创建 venv 后执行 `pip install -e .`。
+## 快速开始
 
-查看全部参数：
+直接抓取并写入默认数据库 `./data/xzqh.db`：
 
 ```bash
-uv run python -m xzqh_crawler --help
+uv run xzqh
 ```
 
----
-
-## 重要说明（L4 抓取策略）
-
-`maxLevel=4` 时，接口允许用 **L2 或 L3** 作为 `code`：
-
-- 对很多省份：用 L2（例如 `4602`）请求 `maxLevel=4` 会直接返回该市下面的 L3 + L4。
-- 对直辖市等结构：需要对每个 L3（例如 `110101`）请求 `maxLevel=4`。
-
----
-
-## 失败重试与断点续跑
-
-抓取 L4 时，程序会把“待抓取任务/已完成任务/失败任务”记录在 SQLite 里（表：`xzqh_jobs`），从而支持断点续跑。
-
-字段示例：
-- `status`: `pending | ok | failed`
-- `try_count`: 已尝试次数
-- `last_error`: 最近一次错误
-
-用法：
-- 运行过程中即使中断也没关系。
-- 再次运行同一个 DB 时，程序会继续处理 `xzqh_jobs` 中的 `pending` / `failed` 任务，无需依赖额外失败文件。
-
----
-
-## 配置文件（可选）
-
-支持 TOML 配置（例如 `config.toml`），并允许命令行参数覆盖配置文件中的默认值。
+指定数据库路径：
 
 ```bash
-python -m xzqh_crawler --config ./config.toml --db-path ./data/xzqh.db
+uv run xzqh --db ./data/custom.db
 ```
 
-具体可用参数请以 `--help` 和源码中的配置模型为准。
+只补抓失败或未完成任务：
 
----
+```bash
+uv run xzqh --resume
+```
+
+调大并发和超时：
+
+```bash
+uv run xzqh --db ./data/xzqh.db -c 40 -t 20
+```
+
+查看帮助：
+
+```bash
+uv run xzqh --help
+```
+
+## 命令行参数
+
+常用参数只有这几个：
+
+- `--db PATH`：SQLite 文件路径，默认 `./data/xzqh.db`
+- `-c, --concurrency`：最大并发抓取数
+- `-t, --timeout`：单请求总超时时间（秒）
+- `-r, --resume`：只处理 `crawl_jobs` 中 `pending/failed` 的任务
+- `-d, --debug`：输出调试日志
+- `-l, --log FILE`：写入日志文件
+
+## 数据表
+
+- `divisions`
+  - `code, name, level, type, parent_code, parent_name, name_path, fetched_at`
+- `crawl_jobs`
+  - `parent_code, state, retry_count, last_error, updated_at`
+
+`crawl_jobs` 用于承载 L4 抓取任务，因此同一个数据库支持断点续跑和失败补抓。
 
 ## 数据说明
 
-统计用区划代码由1～12位代码构成，其各代码表示为：  
-第1～2位，为省级代码；  
-第3～4 位，为地级代码；  
-第5～6位，为县级代码；  
-第7～9位，为乡级代码；  
-第10～12位，为村级代码；  
+统计用区划代码通常由 1～12 位数字构成，各位含义如下：
+
+- 第 1～2 位：省级代码
+- 第 3～4 位：地级代码
+- 第 5～6 位：县级代码
+- 第 7～9 位：乡级代码
+- 第 10～12 位：村级代码
 
 示例：
-- 省级数据(L1): 广东（44）
-- 地市级数据(L2): 广州市（4401）
-- 区县级数据(L3): 越秀区（440104）
-- 乡镇级数据(L4): 白云街道（440104020）
-- 村/社区(L5): **本项目暂无**
 
-## 数据库结构（概览）
+- 省级数据（L1）：广东（`44`）
+- 地市级数据（L2）：广州市（`4401`）
+- 区县级数据（L3）：越秀区（`440104`）
+- 乡镇级数据（L4）：白云街道（`440104020`）
+- 村 / 社区（L5）：本项目暂无
 
-- `xzqh`
-  - 最小字段：`code, name, level, type, parent_code, name_path, created_at, updated_at`
-  - `type` 允许为空（例如根节点）
+当前工具抓取并落库的范围是 L1-L4，不包含 L5。
 
-- `xzqh_jobs`
-  - 用于 L4 抓取任务的断点续跑/补跑
+## 数据约束
 
-## 许可证：MIT License
+- 仅保存 `code` 为纯数字的行政区划记录
+- 非数字 `code` 会在落库前被过滤，并输出 warning 日志
+
+这是为了规避上游偶发脏数据，例如非标准区划代码混入返回结果。
+
+## 测试
+
+运行全部测试：
+
+```bash
+uv run pytest
+```
+
+真实网络集成测试默认关闭，只有显式设置环境变量后才执行：
+
+```bash
+XZQH_INTEGRATION=1 uv run pytest -m integration
+```

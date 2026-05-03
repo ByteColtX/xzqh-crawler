@@ -1,147 +1,198 @@
-"""主入口文件"""
+"""命令行入口。"""
 
-import sys
+from __future__ import annotations
+
 import argparse
-from typing import Optional
+import asyncio
+import sys
+from dataclasses import dataclass
 
-from .config import get_config, create_default_config
-from .utils import setup_logging
 from .crawler import XzqhCrawler
+from .database import Database
+from .utils import setup_logging
+
+DEFAULT_DB_PATH = "./data/xzqh.db"
+DEFAULT_BASE_URL = "https://dmfw.mca.gov.cn"
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_MAX_CONCURRENCY = 20
+DEFAULT_RETRY_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_DELAY = 1.0
+DEFAULT_WRITE_BATCH_SIZE = 200
 
 
-def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description="行政区划代码爬虫")
-    parser.add_argument(
-        "--config",
-        help="配置文件路径",
-    )
-    parser.add_argument(
-        "--db-path",
-        help="数据库文件路径",
-    )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        help="最大工作线程数",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default="INFO",
-        help="日志级别",
-    )
-    parser.add_argument(
-        "--log-file",
-        help="日志文件路径",
-    )
-    parser.add_argument(
-        "--create-config",
-        action="store_true",
-        help="创建默认配置文件",
-    )
-    parser.add_argument(
-        "--progress",
-        dest="progress",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="抓取乡级数据时显示实时进度面板（rich）",
-    )
-    parser.add_argument(
-        "--retry-failed",
-        action="store_true",
-        help="仅重试数据库任务表中 failed/pending 的乡级抓取任务（不重新抓 1-3 级、不重新生成任务）",
-    )
-    
-    args = parser.parse_args()
-    
-    # 如果指定了创建配置文件，则创建并退出
-    if args.create_config:
-        create_default_config()
-        print("默认配置文件已创建: config.toml")
-        return
-    
-    # 加载配置
-    config = get_config(args.config)
-    
-    # 覆盖命令行参数
-    if args.db_path:
-        config.db_path = args.db_path
-    if args.max_workers:
-        config.max_workers = args.max_workers
-    if args.log_level:
-        config.log_level = args.log_level
-    if args.log_file:
-        config.log_file = args.log_file
-    
-    # 设置日志
-    # 当开启 rich 进度面板时，控制台日志会破坏 Live 刷新区域，导致面板被“刷掉”。
-    # 因此默认在 progress=true 时关闭控制台日志，仅写入 --log-file。
+@dataclass(slots=True)
+class CliOptions:
+    """命令行参数。"""
+
+    db_path: str = DEFAULT_DB_PATH
+    base_url: str = DEFAULT_BASE_URL
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
+    write_batch_size: int = DEFAULT_WRITE_BATCH_SIZE
+    log_level: str = "INFO"
+    log_file: str | None = None
+
+
+def main() -> None:
+    """命令行主入口。"""
+    args = _build_parser().parse_args()
+    options = _resolve_options(args)
+
     setup_logging(
-        level=config.log_level,
-        log_file=config.log_file,
-        console=not args.progress,
+        level=options.log_level,
+        log_file=options.log_file,
     )
-    
-    # 创建并运行爬虫
+
+    success = asyncio.run(_run(options, retry_failed=args.resume))
+    sys.exit(0 if success else 1)
+
+
+async def _run(options: CliOptions, *, retry_failed: bool) -> bool:
+    """运行爬虫并打印摘要。"""
     crawler = XzqhCrawler(
-        db_path=config.db_path,
-        base_url=config.base_url,
-        max_workers=config.max_workers,
-        batch_size=config.batch_size,
-        show_progress=args.progress,
-        wait_on_finish=args.progress,
+        db_path=options.db_path,
+        base_url=options.base_url,
+        request_timeout=options.request_timeout,
+        max_concurrency=options.max_concurrency,
+        retry_attempts=options.retry_attempts,
+        retry_base_delay=options.retry_base_delay,
+        write_batch_size=options.write_batch_size,
     )
-    
-    if args.retry_failed:
-        success = crawler.retry_failed_level4_jobs()
-    else:
-        success = crawler.fetch_all()
-    
+
+    success = await (
+        crawler.retry_failed_jobs() if retry_failed else crawler.crawl()
+    )
+
     if success:
-        print("\n✅ 数据获取完成！")
-
-        # progress 模式下默认关闭 console logger（仅写入 --log-file），
-        # 因此这里强制使用 stdout 输出一个最小统计摘要，确保用户能看见。
-        try:
-            from collections import Counter
-            from .database import Database
-
-            db = Database(db_path=config.db_path)
-            stats = db.get_statistics() or {}
-
-            # 仅为了计数，分别按 status 查询（避免改动 database API）
-            job_status_counts: Counter[str] = Counter()
-            job_status_counts["ok"] = len(db.list_level4_jobs_by_status(["ok"]))
-            job_status_counts["failed"] = len(db.list_level4_jobs_by_status(["failed"]))
-            job_status_counts["pending"] = len(db.list_level4_jobs_by_status(["pending"]))
-
-            level_counts = {
-                int(k.split("_")[1]): v for k, v in stats.items() if k.startswith("level_")
-            }
-
-            lines = []
-            lines.append("=" * 60)
-            lines.append("统计摘要")
-            lines.append("=" * 60)
-            lines.append(f"DB: {config.db_path}")
-            lines.append(f"总行数: {stats.get('total', 0)}")
-            if level_counts:
-                lines.append(f"Level 分布: {dict(sorted(level_counts.items()))}")
-            lines.append(
-                "Jobs(level4) 状态: "
-                + f"ok={job_status_counts['ok']} failed={job_status_counts['failed']} pending={job_status_counts['pending']}"
-            )
-            lines.append("=" * 60)
-            print("\n" + "\n".join(lines))
-        except Exception:
-            # 摘要失败不影响主流程
-            pass
-
-        sys.exit(0)
+        print("\n数据获取完成。")
+        await _print_summary(options.db_path)
     else:
-        print("\n❌ 数据获取失败！")
-        sys.exit(1)
+        print("\n数据获取失败。")
+    return success
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。"""
+    parser = argparse.ArgumentParser(
+        prog="xzqh",
+        description="抓取民政部行政区划数据并写入 SQLite。",
+        epilog=(
+            "示例:\n"
+            "  xzqh\n"
+            "  xzqh --db ./data/custom.db\n"
+            "  xzqh --db ./data/xzqh.db -c 40 -t 20\n"
+            "  xzqh --resume"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+    )
+    parser._positionals.title = "参数"
+
+    help_group = parser.add_argument_group("帮助")
+    help_group.add_argument("-h", "--help", action="help", help="显示帮助并退出")
+
+    run_group = parser.add_argument_group("运行选项")
+    run_group.add_argument(
+        "--db",
+        default=DEFAULT_DB_PATH,
+        metavar="PATH",
+        help=f"SQLite 文件路径，默认 {DEFAULT_DB_PATH}",
+    )
+    run_group.add_argument(
+        "-c",
+        "--concurrency",
+        dest="max_concurrency",
+        type=int,
+        metavar="N",
+        default=DEFAULT_MAX_CONCURRENCY,
+        help=f"最大并发抓取数，默认 {DEFAULT_MAX_CONCURRENCY}",
+    )
+    run_group.add_argument(
+        "-t",
+        "--timeout",
+        dest="request_timeout",
+        type=float,
+        metavar="SEC",
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help=f"单请求总超时时间（秒），默认 {DEFAULT_REQUEST_TIMEOUT}",
+    )
+    run_group.add_argument(
+        "-r",
+        "--resume",
+        action="store_true",
+        help="只处理 pending/failed 的任务",
+    )
+    debug_group = parser.add_argument_group("调试选项")
+    debug_group.add_argument("-d", "--debug", action="store_true", help="输出调试日志")
+    debug_group.add_argument("-l", "--log", dest="log_file", metavar="FILE", help="日志文件路径")
+    debug_group.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help=argparse.SUPPRESS,
+    )
+    debug_group.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_RETRY_ATTEMPTS,
+        help=argparse.SUPPRESS,
+    )
+    debug_group.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=DEFAULT_RETRY_BASE_DELAY,
+        help=argparse.SUPPRESS,
+    )
+    debug_group.add_argument(
+        "--write-batch-size",
+        type=int,
+        default=DEFAULT_WRITE_BATCH_SIZE,
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def _resolve_options(args: argparse.Namespace) -> CliOptions:
+    """把参数解析结果转换成运行配置。"""
+    return CliOptions(
+        db_path=args.db,
+        base_url=args.base_url,
+        request_timeout=args.request_timeout,
+        max_concurrency=args.max_concurrency,
+        retry_attempts=args.retry_attempts,
+        retry_base_delay=args.retry_base_delay,
+        write_batch_size=args.write_batch_size,
+        log_level="DEBUG" if args.debug else "INFO",
+        log_file=args.log_file,
+    )
+
+
+async def _print_summary(db_path: str) -> None:
+    """打印数据库统计摘要。"""
+    async with Database(db_path) as db:
+        stats = await db.get_statistics()
+        job_counts = await db.get_crawl_job_counts()
+
+    lines = [
+        "=" * 60,
+        "统计摘要",
+        "=" * 60,
+        f"DB: {db_path}",
+        f"总行数: {stats.get('total', 0)}",
+        (
+            "Level 分布: "
+            f"{ {int(key.split('_')[1]): value for key, value in stats.items() if key.startswith('level_')} }"
+        ),
+        (
+            "Jobs 状态: "
+            f"ok={job_counts.get('ok', 0)} "
+            f"failed={job_counts.get('failed', 0)} "
+            f"pending={job_counts.get('pending', 0)}"
+        ),
+        "=" * 60,
+    ]
+    print("\n" + "\n".join(lines))
 
 
 if __name__ == "__main__":
