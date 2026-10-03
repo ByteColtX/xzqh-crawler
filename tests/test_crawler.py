@@ -121,20 +121,19 @@ async def test_crawler_crawls_level1_to_level4_and_updates_jobs(tmp_path, unused
             max_concurrency=4,
             retry_attempts=2,
             retry_base_delay=0.01,
-            write_batch_size=1,
         )
         success = await crawler.crawl()
 
     assert success is True
-    assert crawler.stats["provinces"] == 2
-    assert crawler.stats["cities"] == 1
-    assert crawler.stats["counties"] == 1
-    assert crawler.stats["townships"] == 2
+    assert crawler.stats.provinces == 2
+    assert crawler.stats.cities == 1
+    assert crawler.stats.counties == 1
+    assert crawler.stats.townships == 2
 
     async with Database(str(db_path)) as db:
         stats = await db.get_statistics()
-        job_counts = await db.get_crawl_job_counts()
+        job_counts = await db.get_task_counts()
 
     assert stats["total"] == 6
     assert stats["level_4"] == 2
-    assert job_counts == {"pending": 0, "ok": 2, "failed": 0}
+    assert job_counts == {"pending": 0, "running": 0, "succeeded": 2, "failed": 0}

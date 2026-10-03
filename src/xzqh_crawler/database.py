@@ -1,389 +1,285 @@
-"""异步数据库访问模块。"""
+"""异步 SQLite 持久化。"""
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 
-from .models import AdministrativeDivision
+from .models import Division, DivisionLevel, TaskState
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True, frozen=True)
-class CrawlJobWrite:
-    """单个抓取任务的落库结果。"""
-
+@dataclass(frozen=True, slots=True)
+class TaskWrite:
     parent_code: str
-    state: str
-    divisions: tuple[AdministrativeDivision, ...] = ()
+    target_level: DivisionLevel
+    state: TaskState
+    divisions: tuple[Division, ...] = ()
     last_error: str | None = None
 
 
 class Database:
-    """SQLite 异步访问封装。"""
-
     def __init__(self, db_path: str = "./data/xzqh.db") -> None:
-        """初始化数据库对象。
-
-        Args:
-            db_path: SQLite 文件路径。
-        """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: aiosqlite.Connection | None = None
+        self.run_id: str | None = None
 
     async def __aenter__(self) -> Database:
-        """进入异步上下文。"""
         await self.open()
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, exc_tb: object) -> None:
-        """退出异步上下文。"""
         await self.close()
 
     async def open(self) -> None:
-        """打开数据库连接并初始化表结构。"""
         if self._conn is not None:
             return
-
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.execute("PRAGMA synchronous = NORMAL")
         await self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS divisions (
                 code TEXT PRIMARY KEY,
-                name TEXT,
-                level INTEGER NOT NULL,
-                type TEXT,
-                parent_code TEXT,
-                parent_name TEXT,
-                name_path TEXT,
-                fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                name TEXT NOT NULL,
+                level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 4),
+                kind TEXT,
+                parent_code TEXT REFERENCES divisions(code),
+                source_version TEXT,
+                fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-
+            CREATE INDEX IF NOT EXISTS idx_divisions_parent_level
+                ON divisions(parent_code, level);
             CREATE INDEX IF NOT EXISTS idx_divisions_level
-            ON divisions(level);
+                ON divisions(level);
 
-            CREATE INDEX IF NOT EXISTS idx_divisions_parent_code
-            ON divisions(parent_code);
-
-            CREATE TABLE IF NOT EXISTS crawl_jobs (
-                parent_code TEXT PRIMARY KEY,
-                state TEXT NOT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS crawl_runs (
+                id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                source_version TEXT,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                stats_json TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_crawl_jobs_state
-            ON crawl_jobs(state);
+            CREATE TABLE IF NOT EXISTS crawl_tasks (
+                run_id TEXT NOT NULL REFERENCES crawl_runs(id),
+                parent_code TEXT NOT NULL,
+                target_level INTEGER NOT NULL CHECK (target_level BETWEEN 1 AND 4),
+                state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                started_at TEXT,
+                lease_until TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, parent_code, target_level)
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_tasks_state
+                ON crawl_tasks(run_id, state);
+
+            CREATE TABLE IF NOT EXISTS division_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                raw_code TEXT,
+                raw_payload TEXT,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """,
         )
         await self._conn.commit()
 
     async def close(self) -> None:
-        """关闭数据库连接。"""
-        if self._conn is None:
-            return
-        await self._conn.close()
-        self._conn = None
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
 
-    async def save_divisions(self, divisions: Sequence[AdministrativeDivision]) -> int:
-        """批量写入行政区划记录。
-
-        Args:
-            divisions: 待保存的行政区划记录列表。
-
-        Returns:
-            int: 实际提交的记录数。
-        """
-        if not divisions:
-            return 0
-
-        filtered_divisions = self._filter_numeric_code_divisions(divisions)
-        if not filtered_divisions:
-            return 0
-
+    async def start_run(self, mode: str = "full", source_version: str | None = None) -> str:
         conn = self._require_connection()
-        rows = [
-            (
-                division.code,
-                division.name,
-                division.level,
-                division.type,
-                division.parent_code,
-                division.parent_name,
-                division.name_path,
+        previous_run_id: str | None = None
+        if mode == "resume":
+            async with conn.execute(
+                "SELECT id FROM crawl_runs WHERE id <> ? ORDER BY started_at DESC LIMIT 1",
+                (self.run_id or "",),
+            ) as cursor:
+                row = await cursor.fetchone()
+            previous_run_id = str(row["id"]) if row else None
+        self.run_id = uuid.uuid4().hex
+        await conn.execute(
+            "INSERT INTO crawl_runs(id, mode, source_version, status, started_at) VALUES (?, ?, ?, 'running', ?)",
+            (self.run_id, mode, source_version, datetime.now(UTC).isoformat()),
+        )
+        if mode == "resume" and previous_run_id:
+            await conn.execute(
+                """
+                INSERT INTO crawl_tasks(run_id, parent_code, target_level, state, attempts, last_error)
+                SELECT ?, parent_code, target_level, state, attempts, last_error
+                FROM crawl_tasks
+                WHERE run_id = ? AND state IN ('pending', 'failed')
+                """,
+                (self.run_id, previous_run_id),
             )
-            for division in filtered_divisions
-        ]
-        await conn.executemany(
-            """
-            INSERT INTO divisions (
-                code,
-                name,
-                level,
-                type,
-                parent_code,
-                parent_name,
-                name_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(code) DO UPDATE SET
-                name = excluded.name,
-                level = excluded.level,
-                type = excluded.type,
-                parent_code = excluded.parent_code,
-                parent_name = excluded.parent_name,
-                name_path = excluded.name_path,
-                fetched_at = CURRENT_TIMESTAMP
-            """,
-            rows,
+        await conn.commit()
+        return self.run_id
+
+    async def finish_run(self, *, status: str, stats: object | None = None) -> None:
+        if self.run_id is None:
+            return
+        conn = self._require_connection()
+        payload = json.dumps(stats, default=str, ensure_ascii=False) if stats is not None else None
+        await conn.execute(
+            "UPDATE crawl_runs SET status = ?, finished_at = ?, stats_json = ? WHERE id = ?",
+            (status, datetime.now(UTC).isoformat(), payload, self.run_id),
         )
         await conn.commit()
-        return len(rows)
 
-    async def get_division(self, code: str) -> AdministrativeDivision | None:
-        """根据代码查询单条行政区划记录。"""
+    async def save_divisions(self, divisions: Sequence[Division]) -> int:
         conn = self._require_connection()
-        async with conn.execute(
-            "SELECT * FROM divisions WHERE code = ?",
-            (code,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_division(row) if row else None
-
-    async def get_parent_codes_for_townships(self) -> list[str]:
-        """查询需要补抓 L4 的父节点代码。"""
-        conn = self._require_connection()
-        async with conn.execute(
-            """
-            SELECT code
-            FROM divisions
-            WHERE level IN (2, 3)
-              AND parent_code IN (SELECT code FROM divisions WHERE level = 1)
-            ORDER BY code
-            """,
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [str(row["code"]) for row in rows]
-
-    async def ensure_crawl_jobs(self, parent_codes: Sequence[str]) -> int:
-        """确保抓取任务存在。"""
-        if not parent_codes:
-            return 0
-
-        conn = self._require_connection()
-        before = conn.total_changes
-        await conn.executemany(
-            """
-            INSERT OR IGNORE INTO crawl_jobs (
-                parent_code,
-                state,
-                retry_count,
-                last_error,
-                updated_at
-            ) VALUES (?, 'pending', 0, NULL, CURRENT_TIMESTAMP)
-            """,
-            [(code,) for code in parent_codes],
-        )
-        await conn.commit()
-        return conn.total_changes - before
-
-    async def list_crawl_jobs(self, states: Sequence[str]) -> list[str]:
-        """按状态列出待抓取任务。"""
-        if not states:
-            return []
-
-        placeholders = ",".join("?" for _ in states)
-        conn = self._require_connection()
-        async with conn.execute(
-            f"""
-            SELECT parent_code
-            FROM crawl_jobs
-            WHERE state IN ({placeholders})
-            ORDER BY parent_code
-            """,
-            list(states),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [str(row["parent_code"]) for row in rows]
-
-    async def apply_crawl_job_writes(self, writes: Sequence[CrawlJobWrite]) -> int:
-        """批量提交抓取结果。
-
-        Args:
-            writes: 已完成的抓取任务结果。
-
-        Returns:
-            int: 写入到 `divisions` 表中的记录数。
-        """
-        if not writes:
-            return 0
-
-        conn = self._require_connection()
-        division_rows: list[tuple[str, str | None, int, str | None, str | None, str | None, str | None]] = []
-        ok_codes: list[tuple[str]] = []
-        failed_rows: list[tuple[str | None, str]] = []
-
-        for write in writes:
-            if write.state == "ok":
-                ok_codes.append((write.parent_code,))
-                division_rows.extend(
-                    (
-                        division.code,
-                        division.name,
-                        division.level,
-                        division.type,
-                        division.parent_code,
-                        division.parent_name,
-                        division.name_path,
-                    )
-                    for division in self._filter_numeric_code_divisions(write.divisions)
-                )
-            else:
-                failed_rows.append(
-                    ((write.last_error or "未知错误")[:500], write.parent_code),
-                )
-
         await conn.execute("BEGIN")
         try:
-            if division_rows:
-                await conn.executemany(
-                    """
-                    INSERT INTO divisions (
-                        code,
-                        name,
-                        level,
-                        type,
-                        parent_code,
-                        parent_name,
-                        name_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(code) DO UPDATE SET
-                        name = excluded.name,
-                        level = excluded.level,
-                        type = excluded.type,
-                        parent_code = excluded.parent_code,
-                        parent_name = excluded.parent_name,
-                        name_path = excluded.name_path,
-                        fetched_at = CURRENT_TIMESTAMP
-                    """,
-                    division_rows,
-                )
-
-            if ok_codes:
-                await conn.executemany(
-                    """
-                    UPDATE crawl_jobs
-                    SET state = 'ok',
-                        last_error = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE parent_code = ?
-                    """,
-                    ok_codes,
-                )
-
-            if failed_rows:
-                await conn.executemany(
-                    """
-                    UPDATE crawl_jobs
-                    SET state = 'failed',
-                        retry_count = retry_count + 1,
-                        last_error = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE parent_code = ?
-                    """,
-                    failed_rows,
-                )
-
+            saved = await self._upsert_divisions(divisions)
             await conn.commit()
+            return saved
         except Exception:
             await conn.rollback()
             raise
 
-        return len(division_rows)
+    async def _upsert_divisions(self, divisions: Sequence[Division]) -> int:
+        conn = self._require_connection()
+        valid: list[Division] = []
+        for division in divisions:
+            if division.validate():
+                valid.append(division)
+            else:
+                await conn.execute(
+                    "INSERT INTO division_rejections(run_id, raw_code, raw_payload, reason) VALUES (?, ?, ?, ?)",
+                    (self.run_id, division.code, None, "代码长度与层级不匹配"),
+                )
+        if not valid:
+            return 0
+        await conn.executemany(
+            """
+            INSERT INTO divisions(code, name, level, kind, parent_code, source_version)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                name = excluded.name, level = excluded.level, kind = excluded.kind,
+                parent_code = excluded.parent_code, source_version = excluded.source_version,
+                fetched_at = CURRENT_TIMESTAMP
+            """,
+            [(d.code, d.name, int(d.level), d.kind, d.parent_code, d.source_version) for d in valid],
+        )
+        return len(valid)
+
+    async def get_division(self, code: str) -> Division | None:
+        conn = self._require_connection()
+        async with conn.execute("SELECT * FROM divisions WHERE code = ?", (code,)) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_division(row) if row else None
+
+    async def get_task_parent_codes(self, target_level: DivisionLevel = DivisionLevel.TOWNSHIP) -> list[str]:
+        conn = self._require_connection()
+        parent_levels = (2, 3) if target_level is DivisionLevel.TOWNSHIP else (int(target_level) - 1,)
+        placeholders = ",".join("?" for _ in parent_levels)
+        async with conn.execute(
+            f"SELECT code FROM divisions WHERE level IN ({placeholders}) ORDER BY code",
+            parent_levels,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [str(row["code"]) for row in rows]
+
+    async def ensure_tasks(self, parent_codes: Sequence[str], target_level: DivisionLevel = DivisionLevel.TOWNSHIP) -> int:
+        if not parent_codes:
+            return 0
+        if self.run_id is None:
+            await self.start_run(mode="resume")
+        conn = self._require_connection()
+        before = conn.total_changes
+        await conn.executemany(
+            "INSERT OR IGNORE INTO crawl_tasks(run_id, parent_code, target_level, state) VALUES (?, ?, ?, 'pending')",
+            [(self.run_id, code, int(target_level)) for code in parent_codes],
+        )
+        await conn.commit()
+        return conn.total_changes - before
+
+    async def list_tasks(self, states: Sequence[TaskState]) -> list[str]:
+        if not states or self.run_id is None:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        conn = self._require_connection()
+        async with conn.execute(
+            f"SELECT parent_code FROM crawl_tasks WHERE run_id = ? AND state IN ({placeholders}) ORDER BY parent_code",
+            [self.run_id, *(str(state) for state in states)],
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [str(row["parent_code"]) for row in rows]
+
+    async def apply_task_write(self, write: TaskWrite) -> int:
+        """在一个独立事务中写入一个任务结果。"""
+        conn = self._require_connection()
+        await conn.execute("BEGIN")
+        try:
+            saved = 0
+            if write.state is TaskState.SUCCEEDED:
+                saved += await self._upsert_divisions(write.divisions)
+            await conn.execute(
+                "UPDATE crawl_tasks SET state = ?, attempts = attempts + 1, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ? AND parent_code = ? AND target_level = ?",
+                (str(write.state), write.last_error, self.run_id, write.parent_code, int(write.target_level)),
+            )
+            await conn.commit()
+            return saved
+        except Exception:
+            await conn.rollback()
+            raise
+
+    async def apply_task_writes(self, writes: Sequence[TaskWrite]) -> int:
+        """逐任务提交结果；每个任务使用独立事务。"""
+        saved = 0
+        for write in writes:
+            saved += await self.apply_task_write(write)
+        return saved
 
     async def get_statistics(self) -> dict[str, int]:
-        """返回分层统计信息。"""
         conn = self._require_connection()
         stats: dict[str, int] = {}
-        async with conn.execute(
-            """
-            SELECT level, COUNT(*) AS count
-            FROM divisions
-            GROUP BY level
-            ORDER BY level
-            """,
-        ) as cursor:
+        async with conn.execute("SELECT level, COUNT(*) AS count FROM divisions GROUP BY level ORDER BY level") as cursor:
             async for row in cursor:
                 stats[f"level_{row['level']}"] = int(row["count"])
-
         async with conn.execute("SELECT COUNT(*) AS total FROM divisions") as cursor:
             row = await cursor.fetchone()
         stats["total"] = int(row["total"]) if row else 0
         return stats
 
-    async def get_crawl_job_counts(self) -> dict[str, int]:
-        """返回任务状态统计。"""
+    async def get_task_counts(self) -> dict[str, int]:
+        counts = {state.value: 0 for state in TaskState}
         conn = self._require_connection()
-        counts = {"pending": 0, "ok": 0, "failed": 0}
-        async with conn.execute(
-            """
-            SELECT state, COUNT(*) AS count
-            FROM crawl_jobs
-            GROUP BY state
-            """,
-        ) as cursor:
-            rows = await cursor.fetchall()
-        for row in rows:
-            counts[str(row["state"])] = int(row["count"])
+        run_id = self.run_id
+        if run_id is None:
+            async with conn.execute("SELECT id FROM crawl_runs ORDER BY started_at DESC LIMIT 1") as cursor:
+                row = await cursor.fetchone()
+            run_id = str(row["id"]) if row else None
+        if run_id is None:
+            return counts
+        async with conn.execute("SELECT state, COUNT(*) AS count FROM crawl_tasks WHERE run_id = ? GROUP BY state", (run_id,)) as cursor:
+            async for row in cursor:
+                counts[str(row["state"])] = int(row["count"])
         return counts
 
     def _require_connection(self) -> aiosqlite.Connection:
-        """返回已建立的连接。"""
         if self._conn is None:
             raise RuntimeError("数据库尚未打开")
         return self._conn
 
-    def _row_to_division(self, row: aiosqlite.Row) -> AdministrativeDivision:
-        """把查询结果转换成数据模型。"""
-        return AdministrativeDivision(
-            code=str(row["code"]),
-            name=row["name"],
-            level=int(row["level"]),
-            type=row["type"],
-            parent_code=row["parent_code"],
-            parent_name=row["parent_name"],
-            name_path=row["name_path"],
-        )
-
-    def _filter_numeric_code_divisions(
-        self,
-        divisions: Sequence[AdministrativeDivision],
-    ) -> list[AdministrativeDivision]:
-        """过滤 `code` 非数字的脏数据。
-
-        Args:
-            divisions: 待落库的行政区划记录。
-
-        Returns:
-            list[AdministrativeDivision]: 仅包含数字代码的记录。
-        """
-        valid_divisions: list[AdministrativeDivision] = []
-        for division in divisions:
-            if division.code and division.code.isdigit():
-                valid_divisions.append(division)
-                continue
-            logger.debug(
-                "跳过非数字 code 的行政区划记录: code=%r name=%r",
-                division.code,
-                division.name,
-            )
-        return valid_divisions
+    def _row_to_division(self, row: aiosqlite.Row) -> Division:
+        return Division(code=str(row["code"]), name=str(row["name"]), level=int(row["level"]), kind=row["kind"], parent_code=row["parent_code"], source_version=row["source_version"])

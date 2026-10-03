@@ -1,128 +1,103 @@
-"""行政区划数据模型。"""
-
+"""接口 DTO、行政区划领域模型和抓取任务模型。"""
 from __future__ import annotations
-
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import IntEnum, StrEnum
 from typing import Any
 
+class DivisionLevel(IntEnum):
+    PROVINCE = 1
+    CITY = 2
+    COUNTY = 3
+    TOWNSHIP = 4
 
-def normalize_xzqh_code(code: str | None) -> str | None:
-    """规范化行政区划代码。
+class TaskState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
-    新接口在 `trimCode=true` 时直接返回短码或变长码，这里只做空白清理。
-
-    Args:
-        code: 原始代码。
-
-    Returns:
-        str | None: 清理后的代码；若为空则返回 `None`。
-    """
-    if code is None:
-        return None
-
-    normalized = str(code).strip()
-    return normalized or None
-
-
-@dataclass(slots=True)
-class TreeNode:
-    """树形行政区划节点。"""
-
-    code: str
-    name: str | None
-    level: int
-    type: str | None = None
-    children: list[TreeNode] = field(default_factory=list)
-
-    @classmethod
-    def from_api_data(cls, data: Mapping[str, Any]) -> TreeNode:
-        """从接口返回结构构建树节点。
-
-        Args:
-            data: 接口返回的单个节点数据。
-
-        Returns:
-            TreeNode: 树节点对象。
-        """
-        children_data = data.get("children") or []
-        children = [cls.from_api_data(child) for child in children_data]
-        return cls(
-            code=str(data.get("code") or ""),
-            name=data.get("name"),
-            level=int(data.get("level") or 0),
-            type=data.get("type"),
-            children=children,
-        )
-
-    def flatten(
-        self,
-        *,
-        parent_code: str | None = None,
-        parent_name: str | None = None,
-        name_path: str | None = None,
-    ) -> list[AdministrativeDivision]:
-        """把树形结构展开为扁平记录。
-
-        Args:
-            parent_code: 父级代码。
-            parent_name: 父级名称。
-            name_path: 祖先名称路径。
-
-        Returns:
-            list[AdministrativeDivision]: 当前节点及全部子孙节点的扁平列表。
-        """
-        current_name = self.name or ""
-        current_name_path = f"{name_path}/{current_name}" if name_path else current_name
-        current = AdministrativeDivision(
-            code=self.code,
-            name=self.name,
-            level=self.level,
-            type=self.type,
-            parent_code=parent_code,
-            parent_name=parent_name,
-            name_path=current_name_path,
-        )
-
-        result = [current]
-        for child in self.children:
-            result.extend(
-                child.flatten(
-                    parent_code=self.code,
-                    parent_name=self.name,
-                    name_path=current_name_path,
-                ),
-            )
-        return result
-
-
-@dataclass(slots=True)
-class AdministrativeDivision:
-    """扁平化行政区划记录。"""
-
-    code: str
-    name: str | None
-    level: int
-    type: str | None = None
-    parent_code: str | None = None
-    parent_name: str | None = None
-    name_path: str | None = None
-
+@dataclass(frozen=True, slots=True)
+class DivisionCode:
+    value: str
+    def __post_init__(self) -> None:
+        value = self.value.strip()
+        if not value or not value.isdigit():
+            raise ValueError(f"非法行政区划代码: {self.value!r}")
+        object.__setattr__(self, "value", value)
     @property
     def province_code(self) -> str:
-        """返回所属省份代码前缀。"""
+        return self.value[:2]
+    def __str__(self) -> str:
+        return self.value
+
+def normalize_xzqh_code(code: str | None) -> str | None:
+    if code is None:
+        return None
+    value = str(code).strip()
+    return value or None
+
+@dataclass(slots=True)
+class ApiDivisionNode:
+    code: str
+    name: str | None
+    level: int
+    kind: str | None = None
+    children: list[ApiDivisionNode] = field(default_factory=list)
+    @classmethod
+    def from_api_data(cls, data: Mapping[str, Any]) -> ApiDivisionNode:
+        children_data = data.get("children") or []
+        children = [cls.from_api_data(child) for child in children_data if isinstance(child, Mapping)]
+        return cls(str(data.get("code") or ""), data.get("name"), int(data.get("level") or 0), data.get("type") or data.get("kind"), children)
+    def flatten(self, *, parent_code: str | None = None) -> list[Division]:
+        result: list[Division] = []
+        next_parent = parent_code
+        if self.level in (1, 2, 3, 4):
+            result.append(Division(code=self.code, name=self.name or "未知", level=self.level, kind=self.kind, parent_code=parent_code))
+            next_parent = self.code
+        for child in self.children:
+            result.extend(child.flatten(parent_code=next_parent))
+        return result
+
+@dataclass(frozen=True, slots=True)
+class Division:
+    code: str
+    name: str
+    level: DivisionLevel | int
+    kind: str | None = None
+    parent_code: str | None = None
+    source_version: str | None = None
+    fetched_at: datetime | None = None
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "code", str(self.code).strip())
+        object.__setattr__(self, "level", DivisionLevel(self.level))
+        if not self.name:
+            raise ValueError("行政区划名称不能为空")
+        if self.parent_code is not None:
+            object.__setattr__(self, "parent_code", str(self.parent_code).strip())
+    @property
+    def province_code(self) -> str:
         return self.code[:2]
-
     def validate(self) -> bool:
-        """验证记录是否合法。
+        return self.code.isdigit() and len(self.code) == {1: 2, 2: 4, 3: 6, 4: 9}[int(self.level)]
 
-        Returns:
-            bool: 数据是否合法。
-        """
-        if not self.code or not self.code.isdigit():
-            return False
-        if len(self.code) not in (1, 2, 4, 6, 9, 12):
-            return False
-        if self.level not in (1, 2, 3, 4):
-            return False
-        return bool(self.name)
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    parent_code: str
+    target_level: DivisionLevel
+    state: TaskState
+    divisions: tuple[Division, ...] = ()
+    error: str | None = None
+
+@dataclass(slots=True)
+class CrawlStats:
+    provinces: int = 0
+    cities: int = 0
+    counties: int = 0
+    townships: int = 0
+    total: int = 0
+    tasks_succeeded: int = 0
+    tasks_failed: int = 0
+    start_time: datetime | None = None
+    end_time: datetime | None = None

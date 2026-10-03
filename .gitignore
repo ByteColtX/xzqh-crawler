@@ -15,8 +15,11 @@ pytest-of-*/
 
 # SQLite / local data
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
+data/audit/
 
 # OS
 .DS_Store

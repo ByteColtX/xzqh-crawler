@@ -7,6 +7,19 @@ import sys
 from pathlib import Path
 
 
+def log_event(
+    logger: logging.Logger,
+    level: int,
+    event: str,
+    **fields: object,
+) -> None:
+    """记录统一格式的事件日志。"""
+    details = " ".join(
+        f"{key}={value!r}" for key, value in fields.items()
+    )
+    logger.log(level, "%s%s", event, f" {details}" if details else "")
+
+
 def setup_logging(
     level: str = "INFO",
     log_file: str | None = None,
@@ -22,7 +35,8 @@ def setup_logging(
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
     formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s - %(message)s",
+        "%(asctime)s %(levelname)-8s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     root_logger = logging.getLogger()
@@ -30,7 +44,10 @@ def setup_logging(
     root_logger.handlers.clear()
 
     if console:
-        console_handler = logging.StreamHandler(sys.stdout)
+        # Keep stdout reserved for command results (including JSON output).
+        # Progress, warnings, and diagnostics belong on stderr so callers can
+        # safely pipe stdout into another command or a file.
+        console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(log_level)
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)

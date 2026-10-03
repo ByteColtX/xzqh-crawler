@@ -29,25 +29,25 @@ uv sync
 直接抓取并写入默认数据库 `./data/xzqh.db`：
 
 ```bash
-uv run xzqh
+uv run xzqh crawl
 ```
 
 指定数据库路径：
 
 ```bash
-uv run xzqh --db ./data/custom.db
+uv run xzqh crawl --database ./data/custom.db
 ```
 
 只补抓失败或未完成任务：
 
 ```bash
-uv run xzqh --resume
+uv run xzqh resume --database ./data/xzqh.db
 ```
 
 调大并发和超时：
 
 ```bash
-uv run xzqh --db ./data/xzqh.db -c 40 -t 20
+uv run xzqh crawl --database ./data/xzqh.db --concurrency 4 --timeout 60 --request-interval 0.25
 ```
 
 查看帮助：
@@ -60,21 +60,44 @@ uv run xzqh --help
 
 常用参数只有这几个：
 
-- `--db PATH`：SQLite 文件路径，默认 `./data/xzqh.db`
-- `-c, --concurrency`：最大并发抓取数
-- `-t, --timeout`：单请求总超时时间（秒）
-- `-r, --resume`：只处理 `crawl_jobs` 中 `pending/failed` 的任务
-- `-d, --debug`：输出调试日志
-- `-l, --log FILE`：写入日志文件
+- `xzqh crawl`：完整抓取 1-4 级数据
+- `xzqh resume`：重试 `pending/failed` 任务
+- `xzqh status`：查看数据和任务统计
+- `--database PATH`：SQLite 文件路径，默认 `./data/xzqh.db`
+- `-c, --concurrency N`：最大并发抓取数，默认 6
+- `-t, --timeout SECONDS`：单请求超时时间，默认 45
+- `--retry-attempts N`：单请求最大尝试次数，默认 5
+- `--retry-base-delay SECONDS`：指数退避基础延迟，默认 2
+- `--retry-max-delay SECONDS`：最大退避延迟，默认 60
+- `--request-interval SECONDS`：请求之间的最小间隔，默认 0.2
+- `--log-level LEVEL`：`DEBUG/INFO/WARNING/ERROR`
+- `--log-file PATH`：写入日志文件
+- `--format text|json`：选择最终结果格式
+- `-q, --quiet`：不输出控制台日志
+- `-v, --verbose`：启用 DEBUG 日志
+
+日志写入 stderr，最终摘要或 JSON 写入 stdout，便于管道处理。遇到大量 502/503 时，优先降低 `--concurrency`、增大 `--request-interval`，然后使用 `xzqh resume`。
 
 ## 数据表
 
 - `divisions`
-  - `code, name, level, type, parent_code, parent_name, name_path, fetched_at`
-- `crawl_jobs`
-  - `parent_code, state, retry_count, last_error, updated_at`
+  - `code, name, level, kind, parent_code, source_version, fetched_at`
+- `crawl_runs`
+  - `id, mode, source_version, status, started_at, finished_at, stats_json`
+- `crawl_tasks`
+  - `run_id, parent_code, target_level, state, attempts, last_error, started_at, lease_until, updated_at`
+- `division_rejections`
+  - `run_id, raw_code, raw_payload, reason, created_at`
 
-`crawl_jobs` 用于承载 L4 抓取任务，因此同一个数据库支持断点续跑和失败补抓。
+抓取运行、任务状态和被拒绝的脏数据分别记录，支持断点续跑、失败补抓和问题审计。
+
+## 数据快照与结构兼容性
+
+可从 [GitHub Releases](https://github.com/ByteColtX/xzqh-crawler/releases) 下载压缩的 SQLite 数据快照及 SHA256 校验文件。
+
+2026-10-04 起的快照采用上文列出的新结构：`divisions.type` 改为 `kind`，移除 `parent_name` 和 `name_path`，新增 `source_version`；`crawl_jobs` 改为按运行记录任务的 `crawl_runs` 和 `crawl_tasks`，另增 `division_rejections`。
+
+当前程序不自动迁移旧版数据库。使用 2026-10-01 或更早的快照时，请保留旧文件，并将新版快照解压到新路径，或指定新路径重新抓取。依赖旧字段的查询需相应调整。
 
 ## 数据说明
 
@@ -98,21 +121,21 @@ uv run xzqh --help
 
 ## 数据约束
 
-- 仅保存 `code` 为纯数字的行政区划记录
-- 非数字 `code` 会在落库前被过滤，并输出 warning 日志
+- 仅保存符合层级长度规则且 `code` 为纯数字的行政区划记录
+- 被拒绝的记录会写入 `division_rejections`，保留代码和拒绝原因
 
-这是为了规避上游偶发脏数据，例如非标准区划代码混入返回结果。
+这是为了规避上游偶发脏数据，同时保留问题审计信息。
 
 ## 测试
 
 运行全部测试：
 
 ```bash
-uv run pytest
+uv run --extra dev python -m pytest
 ```
 
 真实网络集成测试默认关闭，只有显式设置环境变量后才执行：
 
 ```bash
-XZQH_INTEGRATION=1 uv run pytest -m integration
+XZQH_INTEGRATION=1 uv run --extra dev python -m pytest -m integration
 ```
